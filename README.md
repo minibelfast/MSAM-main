@@ -1,15 +1,15 @@
-# GPMA: Gastric Cancer Prognostication Model
+# MSAM: Magnification-adaptive Survival-aware Attention Model
 
 [![ORCID](https://img.shields.io/badge/ORCID-0009--0003--2640--3086-A6CE39?logo=orcid&logoColor=white)](https://orcid.org/my-orcid?orcid=0009-0003-2640-3086)
 [![GitHub](https://img.shields.io/badge/GitHub-minibelfast-181717?logo=github&logoColor=white)](https://github.com/minibelfast)
 [![ResearchGate](https://img.shields.io/badge/ResearchGate-Xuanyu%20Wang-00CCBB?logo=researchgate&logoColor=white)](https://www.researchgate.net/profile/Xuanyu-Wang-11/research)
 [![HuggingFace](https://img.shields.io/badge/HuggingFace-xuanyuwang-FFD21E?logo=huggingface&logoColor=black)](https://huggingface.co/xuanyuwang)
 
-This repository contains the code for the **GPMA (Gastric Cancer Prognostication Model)**. The model is built on top of the Mamba architecture and Attention mechanisms (**MambaAttn**) to achieve prognostic prediction and visualization from Whole Slide Images (WSIs).
+This repository contains the code for the **MSAM (Magnification-adaptive Survival-aware Attention Model)**. The model is built on top of the Mamba architecture and attention-based aggregation modules to achieve robust prognostic prediction, cross-cohort continual learning, and visualization from Whole Slide Images (WSIs).
 
 ## Project Structure
 
-- `models/`: Contains the definition of GPMA-related models (e.g., `MambaAttn.py`) and other baseline MIL models.
+- `models/`: Contains the definition of MSAM-related models (e.g., `MambaAttn.py`, `MSA_MIL.py`) and other baseline MIL models.
 - `part/`: Contains network components such as `TokenSelect`, `WTConv2d`, `GLSA`, `DFF`, etc.
 - `mamba/`: Contains the core Selective Scan Space State Sequential Model (Mamba) implementation.
 - `utils/`: Contains utilities for training, survival loss functions, evaluation, and continual learning (KD/EWC).
@@ -56,8 +56,8 @@ This repository contains the code for the **GPMA (Gastric Cancer Prognostication
   - `case_id`, `slide_id`, `censorship`, `survival_months`
 - Prepare split CSVs under `splits/<YOUR_TASK>_kfold/` as `splits_0.csv ... splits_{k-1}.csv`
 
-### 2. Training the GPMA Model (Survival Prediction)
-We provide training scripts for survival prediction. To train the `mamba_attn` (GPMA) model:
+### 2. Training the MSAM Model (Survival Prediction)
+We provide training scripts for survival prediction. To train the `mamba_attn` / MSAM-style survival model:
 
 ```bash
 bash train_scripts/ATTN_512_survival_k_fold.sh
@@ -96,7 +96,7 @@ python model_eval.py
 Note: you may need to edit the checkpoint path and arguments inside `model_eval.py` to point to your trained model.
 
 ### 4. Visualization
-The `CLAM/` folder contains scripts to visualize the GPMA model's attention heatmaps and feature distributions:
+The `CLAM/` folder contains scripts to visualize the MSAM model's attention heatmaps and feature distributions:
 - Heatmaps: `CLAM/create_heatmaps-tsne.py`, `CLAM/create_heatmaps.py`, `CLAM/create_heatmaps-UNI.py`
 - t-SNE & ERF: `CLAM/create_tsne.py`, `CLAM/create_tsne_2D-new.py`, `CLAM/create_erf-mean.py`, `CLAM/create_erf-max.py`
 
@@ -107,13 +107,11 @@ python CLAM/create_heatmaps-tsne.py
 Please refer to each script for its argument requirements and update paths accordingly.
 
 ## Pretrained Weights
-We provide the best-performing trained model weights here:
-- https://huggingface.co/xuanyuwang/Gastric-Prognostic-Model-Architecture/tree/main
+You can host and organize the best-performing MSAM checkpoints using your Hugging Face page:
+- https://huggingface.co/xuanyuwang
 
 ## Citation
-If you use GPMA in your research, please cite the following (manuscript under review):
-
-> Topology-aware computational pathology reveals spatial ecological states underlying prognosis in gastric cancer
+If you use MSAM in your research, please cite your corresponding manuscript.
 
 ## Acknowledgements
 This project is built upon https://github.com/isyangshu/MambaMIL and https://github.com/mahmoodlab/CLAM.
