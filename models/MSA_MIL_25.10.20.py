@@ -1,0 +1,298 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from part.ASPP import ASPP
+from part.EMA import EMA
+
+class MagnificationAdaptiveModule(nn.Module):
+    def __init__(self, in_dim):
+        super(MagnificationAdaptiveModule, self).__init__()
+        self.mag_detector = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+        
+        self.feature_adapter = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.LayerNorm(in_dim),
+            nn.ReLU()
+        )
+        
+    def forward(self, x):
+        # x shape: (batch_size, n_patches, feat_dim)
+        B, N, D = x.shape
+        
+        # 检测放大倍率
+        patch_features = x.mean(dim=1)  # (B, feat_dim)
+        mag_score = self.mag_detector(patch_features)  # (B, 1)
+        
+        # 特征自适应调整
+        adapted_features = self.feature_adapter(x.view(-1, D)).view(B, N, D)
+        adapted_features = adapted_features * mag_score.unsqueeze(-1)
+        
+        return adapted_features
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction),
+            nn.ReLU(),
+            nn.Linear(in_channels // reduction, in_channels)
+        )
+        
+    def forward(self, x):
+        b, n, c = x.size()
+        x = x.transpose(1, 2)
+        avg_out = self.fc(self.avg_pool(x).squeeze(-1))
+        max_out = self.fc(self.max_pool(x).squeeze(-1))
+        out = torch.sigmoid(avg_out + max_out)
+        return out.view(b, 1, c)
+
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv1d(2, 1, kernel_size=7, padding=3)
+        
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv(x)
+        return torch.sigmoid(x).transpose(1, 2)
+
+class MSA_MIL(nn.Module):
+    def __init__(self, L=512, D=128, K=1, in_dim_titan=768, in_dim_uni=1536, num_classes=2, dropout=0.3):
+        super(MSA_MIL, self).__init__()
+        
+        # 增加特征提取的深度和正则化
+        self.titan_proj = nn.Sequential(
+            nn.Linear(in_dim_titan, L),
+            nn.LayerNorm(L),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(L, L),
+            nn.LayerNorm(L),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.uni_proj = nn.Sequential(
+            nn.Linear(in_dim_uni, L),
+            nn.LayerNorm(L),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(L, L),
+            nn.LayerNorm(L),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # 原有的模型组件保持不变
+        self.n_classes = num_classes
+        self.L = L
+        self.D = D
+        self.K = K
+        
+        # 其他组件保持不变
+        self.aspp = ASPP(L, L)
+        self.norm1 = nn.LayerNorm(L)
+        self.mag_adapter = MagnificationAdaptiveModule(L)
+        # 注意力机制
+        self.attention_U = nn.Sequential(
+            nn.Linear(L, D),
+            nn.LayerNorm(D),
+            nn.Tanh(),
+            nn.Dropout(dropout)
+        )
+        self.attention_weights = nn.Linear(D, K)
+        
+        # 通道和空间注意力
+        self.channel_attention = ChannelAttention(L)
+        self.spatial_attention = SpatialAttention()
+        self.norm2 = nn.LayerNorm(L)
+        
+        # 使用导入的EMA模块
+        self.ema = EMA(L)
+        
+        # 修改分类器以适应新的特征维度
+        self.classifier = nn.Sequential(
+            nn.Linear(L * 4, 384),  # 修改输入维度为L*4，因为我们拼接了4个特征向量
+            nn.LayerNorm(384),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(384, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 4)
+        )
+        # 优化 feature_extractor 结构
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(L, L//4),  # 降维
+            nn.GELU(),  # 使用GELU替代ReLU
+            nn.LayerNorm(L//4),
+            nn.Dropout(dropout),
+            nn.Linear(L//4, L//4),
+            nn.GELU(),
+            nn.LayerNorm(L//4),
+            nn.Dropout(dropout),
+            nn.Linear(L//4, L),
+            nn.LayerNorm(L)
+        )
+
+    def forward(self, x1, x2, return_features=False, return_mag_score=False):
+        # x1: titan特征 (batch_size, 768)
+        # x2: uni特征 (n_patches, 1536)
+        
+        # 处理Titan特征
+        x1 = x1.unsqueeze(1)  # 添加patch维度 [B, 1, 768]
+        x1 = self.titan_proj(x1)  # [B, 1, L]
+        
+        # 处理Uni特征
+        B = x1.size(0)
+        x2 = x2.unsqueeze(0).expand(B, -1, -1)  # [B, n_patches, 1536]
+        x2 = self.uni_proj(x2)  # [B, n_patches, L]
+        
+        # 特征融合
+        x = torch.cat([x1, x2], dim=1)  # [B, n_patches+1, L]
+        
+        # 后续处理保持不变
+        x = self.mag_adapter(x)
+        x = x.float()
+        
+        # 调整维度以适应ASPP的输入要求
+        x = x.unsqueeze(-1)
+        x = x.transpose(1, 2)
+        
+        # 原有的处理流程
+        x = self.aspp(x)
+        x = x.squeeze(-1).transpose(1, 2)
+        x = self.norm1(x)
+        
+        # 通道注意力
+        channel_att = self.channel_attention(x)
+        x = x * channel_att
+        
+        # 空间注意力
+        spatial_att = self.spatial_attention(x)
+        x = x * spatial_att
+        x = self.norm2(x)
+        identity = x
+        x = self.feature_extractor(x)
+        x = x + identity  # 残差连接
+        x = x * torch.sigmoid(x)  # SE-like attention
+        
+        # 添加特征聚合
+        x_mean = torch.mean(x, dim=1, keepdim=True)
+        x_max, _ = torch.max(x, dim=1, keepdim=True)
+        x = x + x_mean + x_max
+        
+        # 调整维度以适应EMA的输入要求 [B, C, H, W]
+        x_ema = x.transpose(1, 2).unsqueeze(-1)  # [B, C, H, 1]
+        ema_features = self.ema(x_ema)
+        # 调整回原始维度 [B, N, C]
+        ema_features = ema_features.squeeze(-1).transpose(1, 2)
+        feature = x + ema_features
+
+        # 特征变换和注意力权重计算
+        A_raw = self.attention_weights(self.attention_U(feature))  # (B, n, K)
+        A = torch.transpose(A_raw, 1, 2)
+        A = F.softmax(A, dim=-1) # [B, K, n]
+        feature = torch.bmm(A, feature) # [B, K, 512]
+        feature = feature.squeeze(0)
+        
+        # 在特征融合后添加特征增强
+        x = torch.cat([x1, x2], dim=1)
+        x = x + torch.randn_like(x) * 0.1 * self.training  # 训练时添加噪声增强泛化能力
+        
+        # 后续处理保持不变
+        x = self.mag_adapter(x)
+        x = x.float()
+        
+        # 调整维度以适应ASPP的输入要求
+        x = x.unsqueeze(-1)
+        x = x.transpose(1, 2)
+        
+        # 原有的处理流程
+        x = self.aspp(x)
+        x = x.squeeze(-1).transpose(1, 2)
+        x = self.norm1(x)
+        
+        # 通道注意力
+        channel_att = self.channel_attention(x)
+        x = x * channel_att
+        
+        # 空间注意力
+        spatial_att = self.spatial_attention(x)
+        x = x * spatial_att
+        x = self.norm2(x)
+        identity = x
+        x = self.feature_extractor(x)
+        x = x + identity  # 残差连接
+        x = x * torch.sigmoid(x)  # SE-like attention
+        
+        # 添加特征聚合
+        x_mean = torch.mean(x, dim=1, keepdim=True)
+        x_max, _ = torch.max(x, dim=1, keepdim=True)
+        x = x + x_mean + x_max
+        
+        # 调整维度以适应EMA的输入要求 [B, C, H, W]
+        x_ema = x.transpose(1, 2).unsqueeze(-1)  # [B, C, H, 1]
+        ema_features = self.ema(x_ema)
+        # 调整回原始维度 [B, N, C]
+        ema_features = ema_features.squeeze(-1).transpose(1, 2)
+        feature = x + ema_features
+
+        # 特征变换和注意力权重计算
+        A_raw = self.attention_weights(self.attention_U(feature))  # (B, n, K)
+        A = torch.transpose(A_raw, 1, 2)
+        A = F.softmax(A, dim=-1) # [B, K, n]
+        feature = torch.bmm(A, feature) # [B, K, 512]
+        feature = feature.squeeze(0)
+        
+        # 修改特征聚合部分
+        feature = feature.unsqueeze(0)  # 添加batch维度
+        feature_scales = [
+            torch.mean(feature, dim=1),  # 全局平均池化
+            torch.max(feature, dim=1)[0],  # 全局最大池化
+            F.adaptive_avg_pool1d(feature.permute(0, 2, 1), 1).squeeze(-1),  # 自适应平均池化
+            F.adaptive_max_pool1d(feature.permute(0, 2, 1), 1).squeeze(-1)   # 自适应最大池化
+        ]
+        feature = torch.cat(feature_scales, dim=-1)  # 拼接多尺度特征 [1, L*4]
+        
+        # 添加标签平滑和温度缩放
+        if self.training:
+            logits = self.classifier(feature) / 2.0  # 增大温度系数
+            Y_prob = F.softmax(logits, dim=1) * 0.8 + 0.2 / logits.size(1)  # 增加标签平滑程度
+        else:
+            logits = self.classifier(feature)
+            Y_prob = F.softmax(logits, dim=1)
+        
+        # 添加标签平滑
+        if self.training:
+            Y_prob = F.softmax(logits, dim=1) * 0.9 + 0.1 / logits.size(1)
+        else:
+            Y_prob = F.softmax(logits, dim=1)
+            
+        Y_hat = torch.topk(logits, 1, dim=1)[1]
+        A_raw = A_raw
+        Y_hat = torch.topk(logits, 1, dim = 1)[1]
+        hazards = torch.sigmoid(logits)
+        S = torch.cumprod(1 - hazards, dim=1)
+        # 如果 return_mag_score 为 True，则只返回 mag_score
+        if return_mag_score:
+            return mag_score
+        return hazards, S, Y_hat, A_raw, Y_prob
